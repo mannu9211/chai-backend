@@ -4,6 +4,8 @@ import { User } from "../models/user.model.js"
 import { uploadOnCloudinary } from "../utils/cloudinary.js"
 import { ApiResponse } from '../utils/ApiResponse.js';
 import jwt from "jsonwebtoken"
+import mongoose from "mongoose";
+import { Video } from "../models/video.model.js";
 
 const generateAccessAndRefreshTokens = async(userId) => {
     try {
@@ -238,7 +240,7 @@ const changeCurrentPassword = asyncHandler(async(req, res) => {
 const getCurrentUser = asyncHandler(async(req, res) => {
     return res
     .status(200)
-    .json(200, requestAnimationFrame, "current user fetched successfully")
+    .json(new ApiResponse(200, req.user, "current user fetched successfully"))
 })
 
 const updateAccountDetails = asyncHandler(async(req, res) => {
@@ -444,6 +446,448 @@ const getWatchHistory =  asyncHandler(async(req, res) => {
     )
 })
 
+
+// Upload video controller
+const uploadVideo = asyncHandler(async (req, res) => {
+    // Get video details from request body
+    const { title, description, tags } = req.body;
+
+    // Validate required fields
+    if (!title?.trim()) {
+        throw new ApiError(400, "Title is required");
+    }
+
+    if (!description?.trim()) {
+        throw new ApiError(400, "Description is required");
+    }
+
+    // Check if video file exists
+    const videoLocalPath = req.files?.video[0]?.path;
+    if (!videoLocalPath) {
+        throw new ApiError(400, "Video file is required");
+    }
+
+    // Check if thumbnail file exists
+    const thumbnailLocalPath = req.files?.thumbnail[0]?.path;
+    if (!thumbnailLocalPath) {
+        throw new ApiError(400, "Thumbnail image is required");
+    }
+
+    // Upload video and thumbnail to Cloudinary
+    const video = await uploadOnCloudinary(videoLocalPath);
+    const thumbnail = await uploadOnCloudinary(thumbnailLocalPath);
+
+    if (!video?.url) {
+        throw new ApiError(400, "Failed to upload video to Cloudinary");
+    }
+
+    if (!thumbnail?.url) {
+        throw new ApiError(400, "Failed to upload thumbnail to Cloudinary");
+    }
+
+    // Process tags if provided
+    let tagsArray = [];
+    if (tags) {
+        tagsArray = tags.split(',').map(tag => tag.trim()).filter(tag => tag.length > 0);
+    }
+
+    // Create video entry in database
+    const videoData = await Video.create({
+        videoFile: video.url,
+        thumbnail: thumbnail.url,
+        title: title.trim(),
+        description: description.trim(),
+        duration: video.duration || 0,
+        owner: req.user._id,
+        views: 0,
+        isPublished: true
+    });
+
+    // Fetch the created video with owner details
+    const createdVideo = await Video.findById(videoData._id)
+        .populate("owner", "username fullName avatar email");
+
+    if (!createdVideo) {
+        throw new ApiError(500, "Something went wrong while uploading video");
+    }
+
+    return res.status(201).json(
+        new ApiResponse(201, createdVideo, "Video uploaded successfully")
+    );
+});
+
+// Get all videos for a specific user
+const getUserVideos = asyncHandler(async (req, res) => {
+    const { userId } = req.params;
+    const { page = 1, limit = 10, status = "all" } = req.query;
+
+    // If no userId provided, use the logged-in user
+    const targetUserId = userId || req.user._id;
+
+    // Build match condition
+    let matchCondition = {
+        owner: new mongoose.Types.ObjectId(targetUserId)
+    };
+
+    // Filter by status if not "all"
+    if (status === "published") {
+        matchCondition.isPublished = true;
+    } else if (status === "unpublished") {
+        matchCondition.isPublished = false;
+    }
+
+    const options = {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        sort: { createdAt: -1 }
+    };
+
+    const pipeline = [
+        {
+            $match: matchCondition
+        },
+        {
+            $lookup: {
+                from: "users",
+                localField: "owner",
+                foreignField: "_id",
+                as: "owner",
+                pipeline: [
+                    {
+                        $project: {
+                            username: 1,
+                            fullName: 1,
+                            avatar: 1,
+                            email: 1
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            $addFields: {
+                owner: { $first: "$owner" }
+            }
+        },
+        {
+            $project: {
+                videoFile: 1,
+                thumbnail: 1,
+                title: 1,
+                description: 1,
+                duration: 1,
+                views: 1,
+                isPublished: 1,
+                createdAt: 1,
+                owner: 1
+            }
+        }
+    ];
+
+    const videos = await Video.aggregatePaginate(
+        Video.aggregate(pipeline),
+        options
+    );
+
+    return res.status(200).json(
+        new ApiResponse(200, videos, "Videos fetched successfully")
+    );
+});
+
+// Get a single video by ID
+const getVideoById = asyncHandler(async (req, res) => {
+    const { videoId } = req.params;
+
+    if (!videoId) {
+        throw new ApiError(400, "Video ID is required");
+    }
+
+    const video = await Video.aggregate([
+        {
+            $match: {
+                _id: new mongoose.Types.ObjectId(videoId)
+            }
+        },
+        {
+            $lookup: {
+                from: "users",
+                localField: "owner",
+                foreignField: "_id",
+                as: "owner",
+                pipeline: [
+                    {
+                        $project: {
+                            username: 1,
+                            fullName: 1,
+                            avatar: 1,
+                            email: 1
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            $addFields: {
+                owner: { $first: "$owner" }
+            }
+        },
+        {
+            $project: {
+                videoFile: 1,
+                thumbnail: 1,
+                title: 1,
+                description: 1,
+                duration: 1,
+                views: 1,
+                tags: 1,
+                isPublished: 1,
+                createdAt: 1,
+                owner: 1
+            }
+        }
+    ]);
+
+    if (!video || video.length === 0) {
+        throw new ApiError(404, "Video not found");
+    }
+
+    // Increment view count (only if video is published)
+    if (video[0].isPublished) {
+        await Video.findByIdAndUpdate(videoId, {
+            $inc: { views: 1 }
+        });
+    }
+
+    return res.status(200).json(
+        new ApiResponse(200, video[0], "Video fetched successfully")
+    );
+});
+
+// Update video details
+const updateVideoDetails = asyncHandler(async (req, res) => {
+    const { videoId } = req.params;
+    const { title, description, tags } = req.body;
+
+    if (!videoId) {
+        throw new ApiError(400, "Video ID is required");
+    }
+
+    // Find the video and verify ownership
+    const video = await Video.findOne({
+        _id: videoId,
+        owner: req.user._id
+    });
+
+    if (!video) {
+        throw new ApiError(404, "Video not found or you don't have permission to update it");
+    }
+
+    // Update fields if provided
+    if (title) video.title = title.trim();
+    if (description) video.description = description.trim();
+    if (tags) {
+        video.tags = tags.split(',').map(tag => tag.trim()).filter(tag => tag.length > 0);
+    }
+
+    await video.save();
+
+    // Fetch updated video with owner details
+    const updatedVideo = await Video.findById(video._id)
+        .populate("owner", "username fullName avatar email");
+
+    return res.status(200).json(
+        new ApiResponse(200, updatedVideo, "Video details updated successfully")
+    );
+});
+
+// Delete a video
+const deleteVideo = asyncHandler(async (req, res) => {
+    const { videoId } = req.params;
+
+    if (!videoId) {
+        throw new ApiError(400, "Video ID is required");
+    }
+
+    // Find and delete the video (ensure ownership)
+    const video = await Video.findOneAndDelete({
+        _id: videoId,
+        owner: req.user._id
+    });
+
+    if (!video) {
+        throw new ApiError(404, "Video not found or you don't have permission to delete it");
+    }
+
+    // Optional: Delete from Cloudinary as well
+    // You might want to implement a function to delete from Cloudinary
+    // const deleteFromCloudinary = async (url) => { ... }
+    // await deleteFromCloudinary(video.videoFile);
+    // await deleteFromCloudinary(video.thumbnail);
+
+    return res.status(200).json(
+        new ApiResponse(200, { deletedVideoId: video._id }, "Video deleted successfully")
+    );
+});
+
+// Toggle video publish status
+const togglePublishStatus = asyncHandler(async (req, res) => {
+    const { videoId } = req.params;
+
+    if (!videoId) {
+        throw new ApiError(400, "Video ID is required");
+    }
+
+    const video = await Video.findOne({
+        _id: videoId,
+        owner: req.user._id
+    });
+
+    if (!video) {
+        throw new ApiError(404, "Video not found or you don't have permission");
+    }
+
+    video.isPublished = !video.isPublished;
+    await video.save();
+
+    return res.status(200).json(
+        new ApiResponse(200, video, `Video ${video.isPublished ? 'published' : 'unpublished'} successfully`)
+    );
+});
+
+// Search videos by title, description, or tags
+const searchVideos = asyncHandler(async (req, res) => {
+    const { query, page = 1, limit = 10 } = req.query;
+
+    if (!query?.trim()) {
+        throw new ApiError(400, "Search query is required");
+    }
+
+    const options = {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        sort: { createdAt: -1 }
+    };
+
+    const pipeline = [
+        {
+            $match: {
+                $and: [
+                    { isPublished: true },
+                    {
+                        $or: [
+                            { title: { $regex: query, $options: "i" } },
+                            { description: { $regex: query, $options: "i" } },
+                            { tags: { $in: [query.toLowerCase()] } }
+                        ]
+                    }
+                ]
+            }
+        },
+        {
+            $lookup: {
+                from: "users",
+                localField: "owner",
+                foreignField: "_id",
+                as: "owner",
+                pipeline: [
+                    {
+                        $project: {
+                            username: 1,
+                            fullName: 1,
+                            avatar: 1
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            $addFields: {
+                owner: { $first: "$owner" }
+            }
+        },
+        {
+            $project: {
+                videoFile: 1,
+                thumbnail: 1,
+                title: 1,
+                description: 1,
+                duration: 1,
+                views: 1,
+                tags: 1,
+                createdAt: 1,
+                owner: 1
+            }
+        }
+    ];
+
+    const videos = await Video.aggregatePaginate(
+        Video.aggregate(pipeline),
+        options
+    );
+
+    return res.status(200).json(
+        new ApiResponse(200, videos, "Videos fetched successfully")
+    );
+});
+
+// Get trending videos (most viewed)
+const getTrendingVideos = asyncHandler(async (req, res) => {
+    const { limit = 10 } = req.query;
+
+    const videos = await Video.aggregate([
+        {
+            $match: { isPublished: true }
+        },
+        {
+            $sort: { views: -1, createdAt: -1 }
+        },
+        {
+            $limit: parseInt(limit)
+        },
+        {
+            $lookup: {
+                from: "users",
+                localField: "owner",
+                foreignField: "_id",
+                as: "owner",
+                pipeline: [
+                    {
+                        $project: {
+                            username: 1,
+                            fullName: 1,
+                            avatar: 1
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            $addFields: {
+                owner: { $first: "$owner" }
+            }
+        },
+        {
+            $project: {
+                videoFile: 1,
+                thumbnail: 1,
+                title: 1,
+                description: 1,
+                duration: 1,
+                views: 1,
+                tags: 1,
+                createdAt: 1,
+                owner: 1
+            }
+        }
+    ]);
+
+    return res.status(200).json(
+        new ApiResponse(200, videos, "Trending videos fetched successfully")
+    );
+});
+
+
+
 export {
     registerUser,
     loginUser,
@@ -455,5 +899,13 @@ export {
     updateUserAvatar,
     updateUserCoverImage,
     getUserChannelProfile,
-    getWatchHistory
+    getWatchHistory,
+    uploadVideo,
+    getUserVideos,
+    getVideoById,
+    updateVideoDetails,
+    deleteVideo,
+    togglePublishStatus,
+    searchVideos,
+    getTrendingVideos
 }
